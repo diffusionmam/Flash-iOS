@@ -2524,6 +2524,121 @@ static int parallel_pread_experts_into(
 }
 
 // ============================================================================
+// Expert LRU Cache: keeps recently-used expert Metal buffers in GPU memory.
+//
+// Key: (layer_idx, expert_idx) -> Metal buffer containing 7.08MB expert data.
+// On cache HIT:  skip pread entirely, use the cached Metal buffer for GPU dispatch.
+// On cache MISS: pread into a new/evicted Metal buffer, insert into cache.
+// LRU eviction:  when cache is full, evict the least recently used entry.
+//
+// Memory budget: 2000 entries * 7.08MB = 14.2GB. With 5.5GB non-expert weights
+// + 14.2GB cache = 19.7GB total. Fits in 48GB with room for OS.
+//
+// Unlike Python/MLX where LRU caching caused Metal heap pressure and slower
+// mx.eval(), here Metal buffers ARE the cache -- no conversion overhead.
+// ============================================================================
+
+typedef struct {
+    int layer_idx;
+    int expert_idx;
+    id<MTLBuffer> buffer;    // Metal buffer holding EXPERT_SIZE bytes
+    uint64_t last_used;      // monotonic counter for LRU ordering
+} ExpertCacheEntry;
+
+typedef struct {
+    ExpertCacheEntry *entries;
+    int max_entries;
+    int num_entries;
+    uint64_t access_counter; // monotonic, incremented on every access
+    id<MTLDevice> device;    // for allocating new Metal buffers
+    // Stats
+    uint64_t hits;
+    uint64_t misses;
+} ExpertLRUCache;
+
+static ExpertLRUCache *g_expert_cache = NULL;
+
+static ExpertLRUCache *expert_cache_new(id<MTLDevice> device, int max_entries) {
+    ExpertLRUCache *cache = calloc(1, sizeof(ExpertLRUCache));
+    cache->entries = calloc(max_entries, sizeof(ExpertCacheEntry));
+    cache->max_entries = max_entries;
+    cache->num_entries = 0;
+    cache->access_counter = 0;
+    cache->device = device;
+    cache->hits = 0;
+    cache->misses = 0;
+    printf("[expert_cache] Initialized: max_entries=%d (%.1f GB budget)\n",
+           max_entries, (double)max_entries * EXPERT_SIZE / 1e9);
+    return cache;
+}
+
+static void expert_cache_free(ExpertLRUCache *cache) {
+    if (!cache) return;
+    printf("[expert_cache] Final stats: %llu hits, %llu misses (%.1f%% hit rate)\n",
+           cache->hits, cache->misses,
+           (cache->hits + cache->misses) > 0
+               ? 100.0 * cache->hits / (cache->hits + cache->misses) : 0.0);
+    // Metal buffers released by ARC when entries are freed
+    free(cache->entries);
+    free(cache);
+}
+
+// Lookup: returns the cached Metal buffer if found, otherwise NULL.
+// On hit, updates the LRU timestamp.
+static id<MTLBuffer> expert_cache_lookup(ExpertLRUCache *cache, int layer_idx, int expert_idx) {
+    for (int i = 0; i < cache->num_entries; i++) {
+        if (cache->entries[i].layer_idx == layer_idx &&
+            cache->entries[i].expert_idx == expert_idx) {
+            cache->entries[i].last_used = ++cache->access_counter;
+            cache->hits++;
+            return cache->entries[i].buffer;
+        }
+    }
+    cache->misses++;
+    return nil;
+}
+
+// Insert: adds a new entry. If the cache is full, evicts the LRU entry.
+// Returns the Metal buffer to pread into (either newly allocated or evicted+reused).
+static id<MTLBuffer> expert_cache_insert(ExpertLRUCache *cache, int layer_idx, int expert_idx) {
+    id<MTLBuffer> buf = nil;
+
+    if (cache->num_entries < cache->max_entries) {
+        // Cache not full: allocate a new Metal buffer
+        buf = [cache->device newBufferWithLength:EXPERT_SIZE
+                                         options:MTLResourceStorageModeShared];
+        if (!buf) {
+            fprintf(stderr, "WARNING: expert_cache: Metal buffer alloc failed at entry %d\n",
+                    cache->num_entries);
+            return nil;
+        }
+        int idx = cache->num_entries++;
+        cache->entries[idx].layer_idx = layer_idx;
+        cache->entries[idx].expert_idx = expert_idx;
+        cache->entries[idx].buffer = buf;
+        cache->entries[idx].last_used = ++cache->access_counter;
+        return buf;
+    }
+
+    // Cache full: find LRU entry (smallest last_used)
+    int lru_idx = 0;
+    uint64_t min_used = cache->entries[0].last_used;
+    for (int i = 1; i < cache->num_entries; i++) {
+        if (cache->entries[i].last_used < min_used) {
+            min_used = cache->entries[i].last_used;
+            lru_idx = i;
+        }
+    }
+
+    // Reuse the evicted entry's Metal buffer (same size, no realloc needed)
+    buf = cache->entries[lru_idx].buffer;
+    cache->entries[lru_idx].layer_idx = layer_idx;
+    cache->entries[lru_idx].expert_idx = expert_idx;
+    cache->entries[lru_idx].last_used = ++cache->access_counter;
+    return buf;
+}
+
+// ============================================================================
 // Background prefetch thread for double-buffered expert I/O (from main.m).
 // Runs pread on a background thread while main thread does GPU compute.
 // Uses pure C I/O plan to avoid ARC issues across threads.
@@ -3586,16 +3701,87 @@ static void fused_layer_forward(
     int actual_K = (K > MAX_K) ? MAX_K : K;
 
     if (packed_fd >= 0 && g_metal && g_metal->buf_multi_expert_data[0]) {
-        // GPU multi-expert path with PARALLEL I/O:
-        // 1. Parallel pread all K experts (4 threads, from main.m pattern)
-        // 2. Copy h_post into shared input buffer
-        // 3. Encode all K expert forwards + shared expert into ONE cmd buffer
-        // 4. Single commit+wait
-        // 5. Read back and accumulate
+        // GPU multi-expert path with LRU cache + parallel I/O:
+        // For each expert:
+        //   - Cache HIT:  dispatch directly from cached Metal buffer (skip pread)
+        //   - Cache MISS: pread into cache buffer, then dispatch from it
+        // Falls back to original parallel_pread_experts when cache is disabled.
 
-        // Step 1: PARALLEL pread all experts (replaces sequential pread)
         int valid[MAX_K];
-        parallel_pread_experts(packed_fd, expert_indices, actual_K, valid);
+        id<MTLBuffer> expert_bufs[MAX_K];  // buffer to dispatch from per expert
+
+        if (g_expert_cache) {
+            // ---- LRU cache path ----
+            // Phase 1: check cache for each expert, collect misses
+            int miss_indices[MAX_K];       // indices into expert_indices[] for misses
+            id<MTLBuffer> miss_bufs[MAX_K]; // cache buffers to pread into
+            int num_misses = 0;
+
+            for (int k = 0; k < actual_K; k++) {
+                id<MTLBuffer> cached = expert_cache_lookup(g_expert_cache, layer_idx, expert_indices[k]);
+                if (cached) {
+                    // Cache hit: use this buffer directly for GPU dispatch
+                    expert_bufs[k] = cached;
+                    valid[k] = 1;
+                } else {
+                    // Cache miss: insert into cache (allocates or evicts), will pread below
+                    id<MTLBuffer> buf = expert_cache_insert(g_expert_cache, layer_idx, expert_indices[k]);
+                    if (buf) {
+                        expert_bufs[k] = buf;
+                        miss_indices[num_misses] = k;
+                        miss_bufs[num_misses] = buf;
+                        num_misses++;
+                        valid[k] = 0;  // not yet loaded
+                    } else {
+                        expert_bufs[k] = nil;
+                        valid[k] = 0;
+                    }
+                }
+            }
+
+            // Phase 2: parallel pread all cache misses
+            if (num_misses > 0) {
+                InferPreadTask tasks[MAX_K];
+                for (int m = 0; m < num_misses; m++) {
+                    int k = miss_indices[m];
+                    tasks[m].fd = packed_fd;
+                    tasks[m].dst = [miss_bufs[m] contents];
+                    tasks[m].offset = (off_t)expert_indices[k] * EXPERT_SIZE;
+                    tasks[m].size = EXPERT_SIZE;
+                    tasks[m].result = 0;
+                }
+
+                int nthreads = (num_misses < NUM_IO_THREADS) ? num_misses : NUM_IO_THREADS;
+                pthread_t threads[NUM_IO_THREADS];
+                InferPreadThreadArg args[NUM_IO_THREADS];
+
+                for (int t = 0; t < nthreads; t++) {
+                    args[t].tasks = tasks;
+                    args[t].num_tasks = num_misses;
+                    args[t].thread_id = t;
+                    pthread_create(&threads[t], NULL, infer_pread_thread_fn, &args[t]);
+                }
+                for (int t = 0; t < nthreads; t++) {
+                    pthread_join(threads[t], NULL);
+                }
+
+                // Mark successfully loaded misses as valid
+                for (int m = 0; m < num_misses; m++) {
+                    int k = miss_indices[m];
+                    valid[k] = (tasks[m].result == EXPERT_SIZE);
+                    if (!valid[k]) {
+                        fprintf(stderr, "WARNING: expert %d pread: %zd/%d\n",
+                                expert_indices[k], tasks[m].result, EXPERT_SIZE);
+                    }
+                }
+            }
+        } else {
+            // ---- No cache: original parallel pread into buf_multi_expert_data ----
+            parallel_pread_experts(packed_fd, expert_indices, actual_K, valid);
+            for (int k = 0; k < actual_K; k++) {
+                expert_bufs[k] = g_metal->buf_multi_expert_data[k];
+            }
+        }
 
         // Step 2: copy input
         memcpy([g_metal->buf_multi_expert_input contents], h_post, HIDDEN_DIM * sizeof(float));
@@ -3605,7 +3791,7 @@ static void fused_layer_forward(
 
         for (int k = 0; k < actual_K; k++) {
             if (!valid[k]) continue;
-            gpu_encode_expert_forward_slot(g_metal, cmd_experts, k);
+            gpu_encode_expert_forward_slot_buf(g_metal, cmd_experts, k, expert_bufs[k]);
         }
 
         // Also encode shared expert SwiGLU + down_proj in the same cmd buffer
@@ -3754,6 +3940,7 @@ static void print_usage(const char *prog) {
     printf("  --prompt TEXT         Prompt text (requires encode_prompt.py)\n");
     printf("  --tokens N           Max tokens to generate (default: 20)\n");
     printf("  --k N                Active experts per layer (default: 4)\n");
+    printf("  --cache-entries N    Expert LRU cache size (default: 0 = disabled, typical: 2000)\n");
     printf("  --help               This message\n");
 }
 
@@ -3767,6 +3954,7 @@ int main(int argc, char **argv) {
         const char *prompt_text = NULL;
         int max_tokens = 20;
         int K = 4;
+        int cache_entries = 0;  // 0 = disabled, typical: 2000
 
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
@@ -3777,13 +3965,14 @@ int main(int argc, char **argv) {
             {"prompt",        required_argument, 0, 'P'},
             {"tokens",        required_argument, 0, 't'},
             {"k",             required_argument, 0, 'k'},
+            {"cache-entries", required_argument, 0, 'C'},
             {"skip-linear",   no_argument,       0, 'S'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:Sh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:Sh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -3793,6 +3982,7 @@ int main(int argc, char **argv) {
                 case 'P': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
                 case 'k': K = atoi(optarg); break;
+                case 'C': cache_entries = atoi(optarg); break;
                 case 'S': linear_attn_bypass = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
@@ -3838,6 +4028,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "WARNING: Metal init failed, falling back to CPU\n");
         }
 
+        // ---- Initialize expert LRU cache ----
+        if (cache_entries > 0 && g_metal) {
+            g_expert_cache = expert_cache_new(g_metal->device, cache_entries);
+        }
+
         printf("=== Qwen3.5-397B-A17B Metal Inference Engine ===\n");
         printf("Model:    %s\n", model_path);
         printf("Weights:  %s\n", weights_path);
@@ -3845,6 +4040,8 @@ int main(int argc, char **argv) {
         printf("Vocab:    %s\n", vocab_path);
         printf("K:        %d experts/layer\n", K);
         printf("Tokens:   %d\n", max_tokens);
+        printf("Cache:    %d entries%s\n", cache_entries,
+               cache_entries > 0 ? "" : " (disabled)");
 
         double t0 = now_ms();
 
@@ -4105,8 +4302,19 @@ int main(int argc, char **argv) {
                    gen_time / 1000.0, (total_generated - 1) * 1000.0 / gen_time);
         }
         printf("Config:         K=%d experts, %d layers\n", K, NUM_LAYERS);
+        if (g_expert_cache) {
+            uint64_t total = g_expert_cache->hits + g_expert_cache->misses;
+            printf("Expert cache:   %llu hits, %llu misses (%.1f%% hit rate), %d/%d entries used\n",
+                   g_expert_cache->hits, g_expert_cache->misses,
+                   total > 0 ? 100.0 * g_expert_cache->hits / total : 0.0,
+                   g_expert_cache->num_entries, g_expert_cache->max_entries);
+        }
 
         // ---- Cleanup ----
+        if (g_expert_cache) {
+            expert_cache_free(g_expert_cache);
+            g_expert_cache = NULL;
+        }
         for (int i = 0; i < NUM_LAYERS; i++) {
             if (kv_caches[i]) kv_cache_free(kv_caches[i]);
             if (layer_states[i]) linear_attn_state_free(layer_states[i]);
