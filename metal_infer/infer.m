@@ -5531,7 +5531,8 @@ static void http_write_str(int fd, const char *s) {
 }
 
 // Send an SSE chunk with a token delta
-static void sse_send_delta(int fd, const char *request_id, const char *token_text) {
+// Returns 0 on success, -1 if client disconnected
+static int sse_send_delta(int fd, const char *request_id, const char *token_text) {
     char chunk[4096];
     // Escape the token text for JSON
     char escaped[2048];
@@ -5551,7 +5552,8 @@ static void sse_send_delta(int fd, const char *request_id, const char *token_tex
         "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\","
         "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}\n\n",
         request_id, escaped);
-    http_write(fd, chunk, n);
+    ssize_t wr = write(fd, chunk, n);
+    return (wr <= 0) ? -1 : 0;
 }
 
 static void sse_send_done(int fd, const char *request_id) {
@@ -6094,7 +6096,10 @@ static void serve_loop(
                 }
 
                 const char *tok_str = decode_token(vocab, next_token);
-                sse_send_delta(client_fd, request_id, tok_str);
+                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                    fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
+                    break;
+                }
                 gen_count++;
 
                 // Generate next
