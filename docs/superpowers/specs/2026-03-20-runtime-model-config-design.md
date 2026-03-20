@@ -97,7 +97,7 @@ Steps:
 1. Resolve HF snapshot directory (walk `snapshots/` if needed, same logic as existing code)
 2. Read and parse `config.json` via NSJSONSerialization
 3. Extract `text_config` sub-dictionary for architecture params
-4. Read `layer_types` array to build `is_full_attn[]`, `full_attn_index[]`, `linear_index[]`
+4. Read `layer_types` array to build `is_full_attn[]`, `full_attn_index[]`, `linear_index[]`. Fallback: if `layer_types` is absent but `full_attn_interval` exists, compute `is_full[i] = ((i+1) % interval == 0)`. If neither exists, fatal error.
 5. Read `quantization` or `quantization_config` for group_size and bits
 6. Read `eos_token_id` (handles both single int and array)
 7. Read `rope_parameters` sub-dict for rope_theta and partial_rotary_factor
@@ -179,11 +179,16 @@ These static arrays use compile-time `NUM_LAYERS`/`NUM_EXPERTS` and must become 
 | `static uint64_t g_cache_last_touch_token[NUM_LAYERS][NUM_EXPERTS]` | `uint64_t *g_cache_last_touch_token` (malloc) |
 | `static uint64_t g_cache_last_evict_token[NUM_LAYERS][NUM_EXPERTS]` | `uint64_t *g_cache_last_evict_token` (malloc) |
 | `static LayerWeightCache layer_cache[NUM_LAYERS]` | `LayerWeightCache *layer_cache` (malloc `num_layers * sizeof(...)`) |
+| `LZ4IndexEntry *g_lz4_index[NUM_LAYERS]` | `LZ4IndexEntry **g_lz4_index` (malloc `num_layers` pointers) |
+| `g_pred_experts[60][MAX_K]` | `int *g_pred_experts` (malloc `num_layers * MAX_K`, note: currently hardcoded to 60, a latent bug) |
+| `g_pred_count[60]` | `int *g_pred_count` (malloc `num_layers`) |
 | `id<MTLBuffer> buf_kv_k[NUM_FULL_ATTN_LAYERS]` | Dynamically allocated array in MetalCtx |
 | `id<MTLBuffer> buf_kv_v[NUM_FULL_ATTN_LAYERS]` | Same |
 | `id<MTLBuffer> buf_delta_state[NUM_LINEAR_LAYERS]` | Same |
 | `id<MTLBuffer> buf_conv_state[NUM_LINEAR_LAYERS]` | Same |
 | `id<MTLBuffer> buf_multi_expert_data[MAX_K]` | Stays `MAX_K` (hardware limit, not model-specific) |
+| Stack VLAs `gpu_delta_snapshots[NUM_LINEAR_LAYERS]` (serve loop) | `malloc`'d at serve entry, freed at exit |
+| Stack VLAs `gpu_conv_snapshots[NUM_LINEAR_LAYERS]` (serve loop) | Same |
 
 Access pattern changes from `g_expert_freq[layer][expert]` to `g_expert_freq[layer * cfg.num_experts + expert]` (flattened 2D indexing). Helper macros can simplify this:
 
@@ -211,7 +216,7 @@ typedef struct {
 
 Only non-model-specific constants:
 
-- `MAX_K 8` — maximum supported experts per token (array sizing)
+- `MAX_K 8` — maximum supported experts per token (array sizing). Note: `MAX_BATCH_SLOTS` (currently 8) is coupled to `MAX_K` — keep them in sync.
 - `GPU_KV_SEQ 8192` — GPU KV pre-allocation (tuning parameter)
 - `TENSOR_HT_SIZE 8192` — hash table size (implementation detail)
 - `NUM_IO_THREADS 8` — I/O thread pool size (hardware tuning)
@@ -229,7 +234,7 @@ int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
 int is_full = cfg.is_full_attn[i];
 ```
 
-The `full_attn_index[]` and `linear_index[]` arrays map global layer index to per-type index (used for KV cache / delta-net state buffer indexing).
+The `full_attn_index[]` and `linear_index[]` arrays map global layer index to per-type index (used for KV cache / delta-net state buffer indexing). All arithmetic formulas like `(layer_idx + 1) / FULL_ATTN_INTERVAL - 1` must be replaced with `cfg.full_attn_index[i]` / `cfg.linear_index[i]` lookups. This includes `build_layer_cache()`, `fused_layer_forward()`, GPU snapshot save/restore, and any other site using the interval formula.
 
 ### Startup sequence
 
@@ -243,17 +248,21 @@ main()
   -> inference loop                   // uses cfg.* throughout
 ```
 
+### Thread safety invariant
+
+`cfg` is immutable after `load_model_config()` returns. It is populated once at startup before any threads are spawned, and is read-only for the entire lifetime of the process. No locking required.
+
 ### CLI change
 
-The existing `--model` flag already accepts a path. No new flags needed. The only change is that `load_model_config()` is called with this path before any other initialization.
+The existing `--model` flag already accepts a path. No new flags needed. The only change is that `load_model_config()` is called with this path before any other initialization. If `--model` is omitted, `load_model_config()` searches for any Qwen model in `~/.cache/huggingface/hub/` or prints a clear error asking the user to provide `--model`.
 
 ### Files changed
 
 | File | Change |
 |------|--------|
-| `metal_infer/infer.m` | Remove ~40 `#define`s, add `ModelConfig` struct + `load_model_config()` (~150 lines), convert 5 static arrays to malloc, update ~200 references from `DEFINE` to `cfg.field` |
-| `metal_infer/chat.m` | If it references model constants, update to `cfg.field` (likely minimal) |
-| `metal_infer/shaders.metal` | No changes (already parameterized) |
+| `metal_infer/infer.m` | Remove ~40 `#define`s, add `ModelConfig` struct + `load_model_config()` (~150 lines), convert ~13 static/stack arrays to malloc, update ~200 references from `DEFINE` to `cfg.field`, replace all `FULL_ATTN_INTERVAL` formula sites with array lookups |
+| `metal_infer/chat.m` | No changes needed (pure HTTP/SSE client, references no model constants) |
+| `metal_infer/shaders.metal` | No changes (already parameterized via kernel arguments) |
 
 ### Validation
 
@@ -274,3 +283,7 @@ This makes it immediately visible which model is loaded and whether the config w
 - Missing `text_config` key → fatal error
 - Missing optional keys (e.g., `linear_conv_kernel_dim`) → use sensible defaults with warning
 - Computed expert offsets are validated against `expert_index.json` if present
+
+### Note on extract_weights.py
+
+`extract_weights.py` currently hardcodes model parameters (layer types, dimensions) when generating the weight manifest. This is acceptable for now — the manifest is generated once per model. A future improvement could make it config-driven too, but it's out of scope for this spec since the runtime engine is the priority.
