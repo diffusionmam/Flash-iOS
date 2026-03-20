@@ -1,16 +1,18 @@
 /*
- * infer.m — Complete Qwen3.5-35B-A3B inference engine using Metal
+ * infer.m — Qwen3.5 MoE inference engine using Metal
  *
- * Full forward pass: embedding -> 40 transformer layers -> norm -> lm_head -> sample
+ * Full forward pass: embedding -> N transformer layers -> norm -> lm_head -> sample
+ * Model architecture loaded at runtime from HuggingFace config.json (--model flag).
  * Non-expert weights loaded from model_weights.bin (mmap'd at startup)
  * Expert weights loaded from packed_experts/ per layer per token (pread)
  *
- * Architecture: Qwen3.5-35B-A3B (MoE)
- *   - 40 layers: 30 linear attention (GatedDeltaNet) + 10 full attention
- *   - hidden_size=2048, head_dim=256, num_attention_heads=16, num_kv_heads=2
- *   - 256 experts/layer, 8 active (K=8)
+ * Supported: Qwen3.5-35B-A3B, Qwen3.5-397B-A17B, and compatible MoE variants.
+ * Architecture auto-detected from config.json:
+ *   - N layers: mix of linear attention (GatedDeltaNet) + full attention
+ *   - Configurable hidden_size, head_dim, num_attention_heads, num_kv_heads
+ *   - Variable experts/layer and active experts (K)
  *   - Shared expert per layer (always active)
- *   - Linear attention: conv1d(kernel=4) + gated delta recurrence
+ *   - Linear attention: conv1d + gated delta recurrence
  *   - Full attention: standard QKV + scaled dot product + RoPE
  *
  * Command buffer optimization (fused_layer_forward):
@@ -6974,7 +6976,8 @@ int main(int argc, char **argv) {
             g_expert_cache = expert_cache_new(g_metal->device, cache_entries);
         }
 
-        printf("=== Qwen3.5-35B-A3B Metal Inference Engine ===\n");
+        printf("=== Flash-MoE Metal Inference Engine ===\n");
+        printf("Config:   %s/config.json\n", cfg.model_path);
         printf("Model:    %s\n", model_path);
         printf("Weights:  %s\n", weights_path);
         printf("Manifest: %s\n", manifest_path);
