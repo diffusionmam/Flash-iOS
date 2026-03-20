@@ -1,14 +1,14 @@
 /*
- * infer.m — Complete Qwen3.5-397B inference engine using Metal
+ * infer.m — Complete Qwen3.5-35B-A3B inference engine using Metal
  *
- * Full forward pass: embedding -> 60 transformer layers -> norm -> lm_head -> sample
+ * Full forward pass: embedding -> 40 transformer layers -> norm -> lm_head -> sample
  * Non-expert weights loaded from model_weights.bin (mmap'd at startup)
  * Expert weights loaded from packed_experts/ per layer per token (pread)
  *
- * Architecture: Qwen3.5-397B-A17B (MoE)
- *   - 60 layers: 45 linear attention (GatedDeltaNet) + 15 full attention
- *   - hidden_size=4096, head_dim=256, num_attention_heads=32, num_kv_heads=2
- *   - 512 experts/layer, 10 active (we use K=4 for speed)
+ * Architecture: Qwen3.5-35B-A3B (MoE)
+ *   - 40 layers: 30 linear attention (GatedDeltaNet) + 10 full attention
+ *   - hidden_size=2048, head_dim=256, num_attention_heads=16, num_kv_heads=2
+ *   - 256 experts/layer, 8 active (K=8)
  *   - Shared expert per layer (always active)
  *   - Linear attention: conv1d(kernel=4) + gated delta recurrence
  *   - Full attention: standard QKV + scaled dot product + RoPE
@@ -66,32 +66,326 @@
 #include <compression.h>
 
 // ============================================================================
+// Runtime model configuration (populated from HuggingFace config.json)
+// ============================================================================
+
+typedef struct {
+    // Core architecture
+    int hidden_dim;
+    int num_layers;
+    int num_attn_heads;
+    int num_kv_heads;
+    int head_dim;
+    int vocab_size;
+    float rms_norm_eps;
+
+    // MoE
+    int num_experts;
+    int num_experts_per_tok;
+    int moe_intermediate;
+    int shared_intermediate;
+    int group_size;
+    int bits;
+
+    // Linear attention (GatedDeltaNet)
+    int linear_num_v_heads;
+    int linear_num_k_heads;
+    int linear_key_dim;
+    int linear_value_dim;
+    int conv_kernel_size;
+
+    // Full attention
+    float rope_theta;
+    float partial_rotary;
+
+    // Layer type map
+    int num_full_attn_layers;
+    int num_linear_layers;
+    bool *is_full_attn;       // [num_layers]
+    int *full_attn_index;     // [num_layers] — index into full-attn buffers, or -1
+    int *linear_index;        // [num_layers] — index into linear-attn buffers, or -1
+
+    // Derived: expert byte offsets (4-bit)
+    size_t expert_size_4bit;
+    size_t gate_w_off_4, gate_s_off_4, gate_b_off_4;
+    size_t up_w_off_4, up_s_off_4, up_b_off_4;
+    size_t down_w_off_4, down_s_off_4, down_b_off_4;
+
+    // Derived: expert byte offsets (2-bit)
+    size_t expert_size_2bit;
+    size_t gate_w_off_2, gate_s_off_2, gate_b_off_2;
+    size_t up_w_off_2, up_s_off_2, up_b_off_2;
+    size_t down_w_off_2, down_s_off_2, down_b_off_2;
+
+    // Derived dimensions
+    int linear_total_key;
+    int linear_total_value;
+    int linear_conv_dim;
+    int rotary_dim;
+
+    // Special tokens
+    int eos_token_ids[8];
+    int num_eos_tokens;
+    int think_start_token;
+    int think_end_token;
+
+    // Context limits
+    int max_seq_len;
+    int gpu_kv_seq;
+
+    // Model path (resolved)
+    char model_path[1024];
+} ModelConfig;
+
+static ModelConfig cfg;
+
+static void compute_expert_offsets(ModelConfig *c) {
+    int mid = c->moe_intermediate;
+    int hid = c->hidden_dim;
+    int gs = c->group_size;
+
+    for (int b = 4; b >= 2; b -= 2) {
+        int vals_per_u32 = 32 / b;
+        // gate_proj [mid, hid]
+        size_t gw = (size_t)mid * ((hid + vals_per_u32 - 1) / vals_per_u32) * 4;
+        size_t gs_sz = (size_t)mid * ((hid + gs - 1) / gs) * 2;
+        size_t gb = gs_sz;
+        // up_proj [mid, hid] — same shape
+        size_t uw = gw, us = gs_sz, ub = gb;
+        // down_proj [hid, mid]
+        size_t dw = (size_t)hid * ((mid + vals_per_u32 - 1) / vals_per_u32) * 4;
+        size_t ds = (size_t)hid * ((mid + gs - 1) / gs) * 2;
+        size_t db = ds;
+
+        size_t off = 0;
+        if (b == 4) {
+            c->gate_w_off_4 = off; off += gw;
+            c->gate_s_off_4 = off; off += gs_sz;
+            c->gate_b_off_4 = off; off += gb;
+            c->up_w_off_4   = off; off += uw;
+            c->up_s_off_4   = off; off += us;
+            c->up_b_off_4   = off; off += ub;
+            c->down_w_off_4 = off; off += dw;
+            c->down_s_off_4 = off; off += ds;
+            c->down_b_off_4 = off; off += db;
+            c->expert_size_4bit = off;
+        } else {
+            c->gate_w_off_2 = off; off += gw;
+            c->gate_s_off_2 = off; off += gs_sz;
+            c->gate_b_off_2 = off; off += gb;
+            c->up_w_off_2   = off; off += uw;
+            c->up_s_off_2   = off; off += us;
+            c->up_b_off_2   = off; off += ub;
+            c->down_w_off_2 = off; off += dw;
+            c->down_s_off_2 = off; off += ds;
+            c->down_b_off_2 = off; off += db;
+            c->expert_size_2bit = off;
+        }
+    }
+}
+
+static void load_model_config(const char *model_dir) {
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.think_start_token = -1;
+    cfg.think_end_token = -1;
+    cfg.gpu_kv_seq = 8192;
+
+    if (!model_dir || !model_dir[0]) {
+        fprintf(stderr, "FATAL: --model path required\n");
+        exit(1);
+    }
+
+    // Resolve HF snapshot directory
+    NSString *base = [NSString stringWithUTF8String:model_dir];
+    NSString *configPath = [base stringByAppendingPathComponent:@"config.json"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    if (![fm fileExistsAtPath:configPath]) {
+        NSString *snapDir = [base stringByAppendingPathComponent:@"snapshots"];
+        if ([fm fileExistsAtPath:snapDir]) {
+            NSArray *snaps = [[fm contentsOfDirectoryAtPath:snapDir error:nil]
+                              sortedArrayUsingSelector:@selector(compare:)];
+            for (NSString *snap in snaps) {
+                NSString *candidate = [[snapDir stringByAppendingPathComponent:snap]
+                                        stringByAppendingPathComponent:@"config.json"];
+                if ([fm fileExistsAtPath:candidate]) {
+                    base = [snapDir stringByAppendingPathComponent:snap];
+                    configPath = candidate;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (![fm fileExistsAtPath:configPath]) {
+        fprintf(stderr, "FATAL: config.json not found in %s\n", model_dir);
+        exit(1);
+    }
+
+    strlcpy(cfg.model_path, [base UTF8String], sizeof(cfg.model_path));
+
+    // Parse config.json
+    NSData *data = [NSData dataWithContentsOfFile:configPath];
+    NSError *jsonErr = nil;
+    NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonErr];
+    if (!root) {
+        fprintf(stderr, "FATAL: failed to parse config.json: %s\n", [[jsonErr localizedDescription] UTF8String]);
+        exit(1);
+    }
+    NSDictionary *tc = root[@"text_config"];
+    if (!tc) { fprintf(stderr, "FATAL: config.json missing text_config\n"); exit(1); }
+
+    cfg.hidden_dim       = [tc[@"hidden_size"] intValue];
+    cfg.num_layers       = [tc[@"num_hidden_layers"] intValue];
+    cfg.num_attn_heads   = [tc[@"num_attention_heads"] intValue];
+    cfg.num_kv_heads     = [tc[@"num_key_value_heads"] intValue];
+    cfg.head_dim         = tc[@"head_dim"] ? [tc[@"head_dim"] intValue] : (cfg.hidden_dim / cfg.num_attn_heads);
+    cfg.vocab_size       = [tc[@"vocab_size"] intValue];
+    cfg.rms_norm_eps     = [tc[@"rms_norm_eps"] floatValue];
+    cfg.num_experts      = [tc[@"num_experts"] intValue];
+    cfg.num_experts_per_tok = [tc[@"num_experts_per_tok"] intValue];
+    cfg.moe_intermediate = [tc[@"moe_intermediate_size"] intValue];
+    cfg.shared_intermediate = [tc[@"shared_expert_intermediate_size"] intValue];
+    cfg.linear_num_v_heads = [tc[@"linear_num_value_heads"] intValue];
+    cfg.linear_num_k_heads = [tc[@"linear_num_key_heads"] intValue];
+    cfg.linear_key_dim   = tc[@"linear_key_head_dim"] ? [tc[@"linear_key_head_dim"] intValue] : 128;
+    cfg.linear_value_dim = tc[@"linear_value_head_dim"] ? [tc[@"linear_value_head_dim"] intValue] : 128;
+    cfg.conv_kernel_size = tc[@"linear_conv_kernel_dim"] ? [tc[@"linear_conv_kernel_dim"] intValue] : 4;
+    cfg.max_seq_len      = [tc[@"max_position_embeddings"] intValue];
+
+    // Quantization
+    NSDictionary *qc = root[@"quantization_config"] ?: root[@"quantization"];
+    if (qc) {
+        cfg.group_size = [qc[@"group_size"] intValue];
+        cfg.bits       = [qc[@"bits"] intValue];
+    } else {
+        cfg.group_size = 64;
+        cfg.bits       = 4;
+        fprintf(stderr, "[config] WARNING: no quantization_config, defaulting to 4-bit group_size=64\n");
+    }
+
+    // RoPE parameters
+    NSDictionary *rope = tc[@"rope_parameters"];
+    if (rope) {
+        cfg.rope_theta    = [rope[@"rope_theta"] floatValue];
+        cfg.partial_rotary = [rope[@"partial_rotary_factor"] floatValue];
+    } else {
+        cfg.rope_theta    = 10000000.0f;
+        cfg.partial_rotary = 0.25f;
+    }
+
+    // Layer types
+    NSArray *layerTypes = tc[@"layer_types"];
+    cfg.is_full_attn    = calloc(cfg.num_layers, sizeof(bool));
+    cfg.full_attn_index = malloc(cfg.num_layers * sizeof(int));
+    cfg.linear_index    = malloc(cfg.num_layers * sizeof(int));
+
+    if (layerTypes && [layerTypes count] == (NSUInteger)cfg.num_layers) {
+        for (int i = 0; i < cfg.num_layers; i++) {
+            cfg.is_full_attn[i] = [layerTypes[i] isEqualToString:@"full_attention"];
+        }
+    } else {
+        int interval = tc[@"full_attention_interval"] ? [tc[@"full_attention_interval"] intValue] : 4;
+        for (int i = 0; i < cfg.num_layers; i++) {
+            cfg.is_full_attn[i] = ((i + 1) % interval == 0);
+        }
+        fprintf(stderr, "[config] Using full_attn_interval=%d (no explicit layer_types)\n", interval);
+    }
+
+    int full_count = 0, linear_count = 0;
+    for (int i = 0; i < cfg.num_layers; i++) {
+        if (cfg.is_full_attn[i]) {
+            cfg.full_attn_index[i] = full_count++;
+            cfg.linear_index[i] = -1;
+        } else {
+            cfg.linear_index[i] = linear_count++;
+            cfg.full_attn_index[i] = -1;
+        }
+    }
+    cfg.num_full_attn_layers = full_count;
+    cfg.num_linear_layers = linear_count;
+
+    // EOS tokens (can be int or array in config.json)
+    id eosVal = root[@"eos_token_id"];
+    if ([eosVal isKindOfClass:[NSArray class]]) {
+        NSArray *arr = (NSArray *)eosVal;
+        cfg.num_eos_tokens = (int)[arr count];
+        if (cfg.num_eos_tokens > 8) cfg.num_eos_tokens = 8;
+        for (int i = 0; i < cfg.num_eos_tokens; i++)
+            cfg.eos_token_ids[i] = [arr[i] intValue];
+    } else if (eosVal) {
+        cfg.num_eos_tokens = 1;
+        cfg.eos_token_ids[0] = [eosVal intValue];
+    }
+
+    // Think tokens from tokenizer.json added_tokens
+    NSString *tokPath = [base stringByAppendingPathComponent:@"tokenizer.json"];
+    if ([fm fileExistsAtPath:tokPath]) {
+        NSData *tokData = [NSData dataWithContentsOfFile:tokPath];
+        NSDictionary *tokRoot = [NSJSONSerialization JSONObjectWithData:tokData options:0 error:nil];
+        NSArray *addedTokens = tokRoot[@"added_tokens"];
+        if (addedTokens) {
+            for (NSDictionary *tok in addedTokens) {
+                NSString *content = tok[@"content"];
+                int tid = [tok[@"id"] intValue];
+                if ([content isEqualToString:@"<think>"]) cfg.think_start_token = tid;
+                else if ([content isEqualToString:@"</think>"]) cfg.think_end_token = tid;
+            }
+        }
+    } else {
+        fprintf(stderr, "[config] WARNING: tokenizer.json not found, think tokens disabled\n");
+    }
+
+    // Derived dimensions
+    cfg.linear_total_key   = cfg.linear_num_k_heads * cfg.linear_key_dim;
+    cfg.linear_total_value = cfg.linear_num_v_heads * cfg.linear_value_dim;
+    cfg.linear_conv_dim    = cfg.linear_total_key * 2 + cfg.linear_total_value;
+    cfg.rotary_dim         = (int)(cfg.head_dim * cfg.partial_rotary);
+
+    // Expert byte offsets
+    compute_expert_offsets(&cfg);
+
+    // Summary
+    fprintf(stderr, "[config] %d layers (%d linear + %d full), hidden=%d, heads=%d, kv_heads=%d, head_dim=%d\n",
+            cfg.num_layers, cfg.num_linear_layers, cfg.num_full_attn_layers,
+            cfg.hidden_dim, cfg.num_attn_heads, cfg.num_kv_heads, cfg.head_dim);
+    fprintf(stderr, "[config] %d experts (K=%d), moe_intermediate=%d, shared=%d\n",
+            cfg.num_experts, cfg.num_experts_per_tok, cfg.moe_intermediate, cfg.shared_intermediate);
+    fprintf(stderr, "[config] %d-bit quantization, group_size=%d, expert_size=%zu bytes\n",
+            cfg.bits, cfg.group_size, cfg.expert_size_4bit);
+    fprintf(stderr, "[config] EOS tokens: [");
+    for (int i = 0; i < cfg.num_eos_tokens; i++)
+        fprintf(stderr, "%s%d", i ? ", " : "", cfg.eos_token_ids[i]);
+    fprintf(stderr, "], think: %d/%d\n", cfg.think_start_token, cfg.think_end_token);
+}
+
+// ============================================================================
 // Model constants
 // ============================================================================
 
-#define HIDDEN_DIM          4096
-#define NUM_LAYERS          60
-#define NUM_ATTN_HEADS      32
+#define HIDDEN_DIM          2048
+#define NUM_LAYERS          40
+#define NUM_ATTN_HEADS      16
 #define NUM_KV_HEADS        2
 #define HEAD_DIM            256
 #define VOCAB_SIZE          248320
 #define RMS_NORM_EPS        1e-6f
-#define NUM_EXPERTS         512
-#define NUM_EXPERTS_PER_TOK 10
-#define MOE_INTERMEDIATE    1024
-#define SHARED_INTERMEDIATE 1024
+#define NUM_EXPERTS         256
+#define NUM_EXPERTS_PER_TOK 8
+#define MOE_INTERMEDIATE    512
+#define SHARED_INTERMEDIATE 512
 #define FULL_ATTN_INTERVAL  4
 #define GROUP_SIZE          64
 #define BITS                4
 
 // Linear attention (GatedDeltaNet) constants
-#define LINEAR_NUM_V_HEADS  64
+#define LINEAR_NUM_V_HEADS  32
 #define LINEAR_NUM_K_HEADS  16
 #define LINEAR_KEY_DIM      128   // head_k_dim
 #define LINEAR_VALUE_DIM    128   // head_v_dim
 #define LINEAR_TOTAL_KEY    (LINEAR_NUM_K_HEADS * LINEAR_KEY_DIM)   // 2048
-#define LINEAR_TOTAL_VALUE  (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM) // 8192
-#define LINEAR_CONV_DIM     (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) // 12288
+#define LINEAR_TOTAL_VALUE  (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM) // 4096
+#define LINEAR_CONV_DIM     (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) // 8192
 #define CONV_KERNEL_SIZE    4
 
 // Full attention constants
@@ -99,23 +393,36 @@
 #define PARTIAL_ROTARY      0.25f
 #define ROTARY_DIM          (int)(HEAD_DIM * PARTIAL_ROTARY)  // 64
 
-// Expert packed binary layout (from existing code)
-#define EXPERT_SIZE         7077888
+// Expert packed binary layout for Qwen3.5-35B-A3B (4-bit, group_size=64)
+// gate_proj/up_proj: [512, 2048] -> weight [512,256] uint32 = 524288, scales [512,32] bf16 = 32768
+// down_proj: [2048, 512] -> weight [2048,64] uint32 = 524288, scales [2048,8] bf16 = 32768
+#define EXPERT_SIZE         1769472
+#define GATE_W_OFF_4  0
+#define GATE_S_OFF_4  524288
+#define GATE_B_OFF_4  557056
+#define UP_W_OFF_4    589824
+#define UP_S_OFF_4    1114112
+#define UP_B_OFF_4    1146880
+#define DOWN_W_OFF_4  1179648
+#define DOWN_S_OFF_4  1703936
+#define DOWN_B_OFF_4  1736704
 
-// 2-bit expert layout (from repack_experts_2bit.py)
-#define EXPERT_SIZE_2BIT    3932160
+// 2-bit expert layout (halved weight arrays, same scales/biases)
+// weight arrays: 16 vals per uint32 instead of 8
+// gate/up: [512, 128] uint32 = 262144, down: [2048, 32] uint32 = 262144
+#define EXPERT_SIZE_2BIT    983040
 #define GATE_W_OFF_2  0
-#define GATE_S_OFF_2  1048576
-#define GATE_B_OFF_2  1179648
-#define UP_W_OFF_2    1310720
-#define UP_S_OFF_2    2359296
-#define UP_B_OFF_2    2490368
-#define DOWN_W_OFF_2  2621440
-#define DOWN_S_OFF_2  3670016
-#define DOWN_B_OFF_2  3801088
+#define GATE_S_OFF_2  262144
+#define GATE_B_OFF_2  294912
+#define UP_W_OFF_2    327680
+#define UP_S_OFF_2    589824
+#define UP_B_OFF_2    622592
+#define DOWN_W_OFF_2  655360
+#define DOWN_S_OFF_2  917504
+#define DOWN_B_OFF_2  950272
 
 // KV cache maximum context length
-#define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
+#define MAX_SEQ_LEN 262144   // 256K context — only 10 full-attn layers need KV cache
 #define GPU_KV_SEQ  8192     // GPU KV buffer pre-allocation (grows if exceeded, falls back to CPU attn)
 
 // Special tokens
@@ -124,7 +431,7 @@
 #define THINK_START_TOKEN   248068  // <think>
 #define THINK_END_TOKEN     248069  // </think>
 
-#define MODEL_PATH_DEFAULT "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+#define MODEL_PATH_DEFAULT "/Users/alexintosh/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit"
 
 // ============================================================================
 // Timing helper
@@ -578,6 +885,47 @@ typedef struct {
     int num_tokens;
 } Vocabulary;
 
+// GPT-2 BPE byte decoder: convert BPE Unicode chars back to raw bytes.
+// In GPT-2 BPE, bytes 0x00-0xFF are mapped to Unicode codepoints:
+//   printable ASCII (0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF) map to themselves
+//   everything else maps to U+0100 + offset (e.g., space 0x20 → U+0120 'Ġ')
+// This function decodes a UTF-8 BPE string back to raw bytes in-place.
+static int bpe_decode_inplace(char *s, int len) {
+    int out = 0;
+    int i = 0;
+    while (i < len) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) {
+            // ASCII byte — pass through
+            s[out++] = s[i++];
+        } else if ((c & 0xE0) == 0xC0 && i + 1 < len) {
+            // 2-byte UTF-8: U+0080 to U+07FF
+            unsigned int cp = ((c & 0x1F) << 6) | ((unsigned char)s[i+1] & 0x3F);
+            if (cp >= 0x100 && cp <= 0x1FF) {
+                // GPT-2 BPE mapped byte: U+0100+byte → original byte
+                s[out++] = (char)(cp - 0x100);
+            } else {
+                // Regular Unicode char — keep UTF-8 encoding
+                s[out++] = s[i];
+                s[out++] = s[i+1];
+            }
+            i += 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < len) {
+            // 3-byte UTF-8
+            s[out++] = s[i]; s[out++] = s[i+1]; s[out++] = s[i+2];
+            i += 3;
+        } else if ((c & 0xF8) == 0xF0 && i + 3 < len) {
+            // 4-byte UTF-8
+            s[out++] = s[i]; s[out++] = s[i+1]; s[out++] = s[i+2]; s[out++] = s[i+3];
+            i += 4;
+        } else {
+            s[out++] = s[i++];
+        }
+    }
+    s[out] = '\0';
+    return out;
+}
+
 static Vocabulary *load_vocab(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -601,7 +949,8 @@ static Vocabulary *load_vocab(const char *path) {
             v->tokens[i] = malloc(byte_len + 1);
             fread(v->tokens[i], 1, byte_len, f);
             v->tokens[i][byte_len] = '\0';
-            v->lengths[i] = byte_len;
+            // Decode GPT-2 BPE byte encoding (Ġ→space, Ċ→newline, etc.)
+            v->lengths[i] = bpe_decode_inplace(v->tokens[i], byte_len);
         }
     }
 
@@ -953,7 +1302,7 @@ typedef struct {
     id<MTLBuffer> buf_h_mid;        // [HIDDEN_DIM floats] residual+oproj result
     id<MTLBuffer> buf_sum_sq;       // [1 float] for RMS norm reduction
     // GPU attention buffers (for full attention layers)
-    #define NUM_FULL_ATTN_LAYERS 15
+    #define NUM_FULL_ATTN_LAYERS 10
     id<MTLBuffer> buf_kv_k[NUM_FULL_ATTN_LAYERS];  // K cache per full-attn layer
     id<MTLBuffer> buf_kv_v[NUM_FULL_ATTN_LAYERS];  // V cache per full-attn layer
     id<MTLBuffer> buf_attn_q;       // [NUM_ATTN_HEADS * HEAD_DIM floats] all query heads
@@ -975,18 +1324,18 @@ typedef struct {
     id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
     id<MTLComputePipelineState> gated_rms_norm;  // z-gated output normalization
     // Persistent GPU state buffers for linear attention layers
-    #define NUM_LINEAR_LAYERS 45
-    id<MTLBuffer> buf_delta_state[NUM_LINEAR_LAYERS];   // [64*128*128] float per layer
-    id<MTLBuffer> buf_conv_state[NUM_LINEAR_LAYERS];     // [3*12288] float per layer
+    #define NUM_LINEAR_LAYERS 30
+    id<MTLBuffer> buf_delta_state[NUM_LINEAR_LAYERS];   // [32*128*128] float per layer
+    id<MTLBuffer> buf_conv_state[NUM_LINEAR_LAYERS];     // [3*8192] float per layer
     // Scratch buffers for delta-net inputs/outputs
-    id<MTLBuffer> buf_delta_q;        // [2048] float
-    id<MTLBuffer> buf_delta_k;        // [2048] float
-    id<MTLBuffer> buf_delta_v;        // [8192] float
-    id<MTLBuffer> buf_delta_g_decay;  // [64] float
-    id<MTLBuffer> buf_delta_beta;     // [64] float
-    id<MTLBuffer> buf_delta_output;   // [8192] float
-    id<MTLBuffer> buf_conv_input;     // [12288] float
-    id<MTLBuffer> buf_conv_output;    // [12288] float
+    id<MTLBuffer> buf_delta_q;        // [LINEAR_TOTAL_KEY=2048] float
+    id<MTLBuffer> buf_delta_k;        // [LINEAR_TOTAL_KEY=2048] float
+    id<MTLBuffer> buf_delta_v;        // [LINEAR_TOTAL_VALUE=4096] float
+    id<MTLBuffer> buf_delta_g_decay;  // [LINEAR_NUM_V_HEADS=32] float
+    id<MTLBuffer> buf_delta_beta;     // [LINEAR_NUM_V_HEADS=32] float
+    id<MTLBuffer> buf_delta_output;   // [LINEAR_TOTAL_VALUE=4096] float
+    id<MTLBuffer> buf_conv_input;     // [LINEAR_CONV_DIM=8192] float
+    id<MTLBuffer> buf_conv_output;    // [LINEAR_CONV_DIM=8192] float
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -1193,26 +1542,28 @@ static MetalCtx *metal_setup(void) {
     // Persistent GPU state buffers for delta-net (linear attention layers)
     if (ctx->delta_net_step) {
         for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
-            ctx->buf_delta_state[i] = [ctx->device newBufferWithLength:64*128*128*sizeof(float)
+            ctx->buf_delta_state[i] = [ctx->device newBufferWithLength:(size_t)LINEAR_NUM_V_HEADS*LINEAR_VALUE_DIM*LINEAR_KEY_DIM*sizeof(float)
                                                                options:MTLResourceStorageModeShared];
-            memset([ctx->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
-            ctx->buf_conv_state[i] = [ctx->device newBufferWithLength:3*12288*sizeof(float)
+            memset([ctx->buf_delta_state[i] contents], 0, (size_t)LINEAR_NUM_V_HEADS*LINEAR_VALUE_DIM*LINEAR_KEY_DIM*sizeof(float));
+            ctx->buf_conv_state[i] = [ctx->device newBufferWithLength:(CONV_KERNEL_SIZE-1)*(size_t)LINEAR_CONV_DIM*sizeof(float)
                                                               options:MTLResourceStorageModeShared];
-            memset([ctx->buf_conv_state[i] contents], 0, 3*12288*sizeof(float));
+            memset([ctx->buf_conv_state[i] contents], 0, (CONV_KERNEL_SIZE-1)*(size_t)LINEAR_CONV_DIM*sizeof(float));
         }
         // Scratch buffers for delta-net inputs/outputs (allocated once, reused)
-        ctx->buf_delta_q       = [ctx->device newBufferWithLength:2048*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_k       = [ctx->device newBufferWithLength:2048*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_v       = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_g_decay = [ctx->device newBufferWithLength:64*sizeof(float)    options:MTLResourceStorageModeShared];
-        ctx->buf_delta_beta    = [ctx->device newBufferWithLength:64*sizeof(float)    options:MTLResourceStorageModeShared];
-        ctx->buf_delta_output  = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_conv_input    = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
-        ctx->buf_conv_output   = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
+        ctx->buf_delta_q       = [ctx->device newBufferWithLength:LINEAR_TOTAL_KEY*sizeof(float)    options:MTLResourceStorageModeShared];
+        ctx->buf_delta_k       = [ctx->device newBufferWithLength:LINEAR_TOTAL_KEY*sizeof(float)    options:MTLResourceStorageModeShared];
+        ctx->buf_delta_v       = [ctx->device newBufferWithLength:LINEAR_TOTAL_VALUE*sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_delta_g_decay = [ctx->device newBufferWithLength:LINEAR_NUM_V_HEADS*sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_delta_beta    = [ctx->device newBufferWithLength:LINEAR_NUM_V_HEADS*sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_delta_output  = [ctx->device newBufferWithLength:LINEAR_TOTAL_VALUE*sizeof(float)  options:MTLResourceStorageModeShared];
+        ctx->buf_conv_input    = [ctx->device newBufferWithLength:LINEAR_CONV_DIM*sizeof(float)     options:MTLResourceStorageModeShared];
+        ctx->buf_conv_output   = [ctx->device newBufferWithLength:LINEAR_CONV_DIM*sizeof(float)     options:MTLResourceStorageModeShared];
+        size_t state_bytes = (size_t)LINEAR_NUM_V_HEADS*LINEAR_VALUE_DIM*LINEAR_KEY_DIM*sizeof(float);
+        size_t conv_bytes = (CONV_KERNEL_SIZE-1)*(size_t)LINEAR_CONV_DIM*sizeof(float);
         printf("[metal] Delta-net GPU buffers: %d layers (%.1f MB state + %.1f MB scratch)\n",
                NUM_LINEAR_LAYERS,
-               NUM_LINEAR_LAYERS * (64*128*128*4 + 3*12288*4) / 1e6,
-               (2048+2048+8192+64+64+8192+12288+12288) * 4 / 1e6);
+               NUM_LINEAR_LAYERS * (state_bytes + conv_bytes) / 1e6,
+               (LINEAR_TOTAL_KEY*2+LINEAR_TOTAL_VALUE*2+LINEAR_NUM_V_HEADS*2+LINEAR_CONV_DIM*2) * sizeof(float) / 1e6);
     }
 
     // Create shared event for CPU-GPU async pipeline
@@ -1228,9 +1579,9 @@ static void reset_delta_net_state(void) {
     if (!g_metal || !g_metal->delta_net_step) return;
     for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
         if (g_metal->buf_delta_state[i])
-            memset([g_metal->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
+            memset([g_metal->buf_delta_state[i] contents], 0, (size_t)LINEAR_NUM_V_HEADS*LINEAR_VALUE_DIM*LINEAR_KEY_DIM*sizeof(float));
         if (g_metal->buf_conv_state[i])
-            memset([g_metal->buf_conv_state[i] contents], 0, 3*12288*sizeof(float));
+            memset([g_metal->buf_conv_state[i] contents], 0, (CONV_KERNEL_SIZE-1)*(size_t)LINEAR_CONV_DIM*sizeof(float));
     }
 }
 
@@ -1512,9 +1863,9 @@ static void gpu_encode_expert_forward_slot(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = GATE_W_OFF_4; gate_s_off = GATE_S_OFF_4; gate_b_off = GATE_B_OFF_4;
+        up_w_off   = UP_W_OFF_4;   up_s_off   = UP_S_OFF_4;   up_b_off   = UP_B_OFF_4;
+        down_w_off = DOWN_W_OFF_4;  down_s_off = DOWN_S_OFF_4;  down_b_off = DOWN_B_OFF_4;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1608,9 +1959,9 @@ static void gpu_encode_expert_forward_slot_buf(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = GATE_W_OFF_4; gate_s_off = GATE_S_OFF_4; gate_b_off = GATE_B_OFF_4;
+        up_w_off   = UP_W_OFF_4;   up_s_off   = UP_S_OFF_4;   up_b_off   = UP_B_OFF_4;
+        down_w_off = DOWN_W_OFF_4;  down_s_off = DOWN_S_OFF_4;  down_b_off = DOWN_B_OFF_4;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1708,9 +2059,9 @@ static void gpu_encode_experts_batched(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = GATE_W_OFF_4; gate_s_off = GATE_S_OFF_4; gate_b_off = GATE_B_OFF_4;
+        up_w_off   = UP_W_OFF_4;   up_s_off   = UP_S_OFF_4;   up_b_off   = UP_B_OFF_4;
+        down_w_off = DOWN_W_OFF_4;  down_s_off = DOWN_S_OFF_4;  down_b_off = DOWN_B_OFF_4;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1793,15 +2144,15 @@ static void gpu_encode_expert_forward(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf
 ) {
-    NSUInteger gate_w_off = 0;
-    NSUInteger gate_s_off = 2097152;
-    NSUInteger gate_b_off = 2228224;
-    NSUInteger up_w_off   = 2359296;
-    NSUInteger up_s_off   = 4456448;
-    NSUInteger up_b_off   = 4587520;
-    NSUInteger down_w_off = 4718592;
-    NSUInteger down_s_off = 6815744;
-    NSUInteger down_b_off = 6946816;
+    NSUInteger gate_w_off = GATE_W_OFF_4;
+    NSUInteger gate_s_off = GATE_S_OFF_4;
+    NSUInteger gate_b_off = GATE_B_OFF_4;
+    NSUInteger up_w_off   = UP_W_OFF_4;
+    NSUInteger up_s_off   = UP_S_OFF_4;
+    NSUInteger up_b_off   = UP_B_OFF_4;
+    NSUInteger down_w_off = DOWN_W_OFF_4;
+    NSUInteger down_s_off = DOWN_S_OFF_4;
+    NSUInteger down_b_off = DOWN_B_OFF_4;
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1917,9 +2268,9 @@ static void gpu_expert_forward(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = GATE_W_OFF_4; gate_s_off = GATE_S_OFF_4; gate_b_off = GATE_B_OFF_4;
+        up_w_off   = UP_W_OFF_4;   up_s_off   = UP_S_OFF_4;   up_b_off   = UP_B_OFF_4;
+        down_w_off = DOWN_W_OFF_4;  down_s_off = DOWN_S_OFF_4;  down_b_off = DOWN_B_OFF_4;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -2756,14 +3107,14 @@ static void moe_forward(
                 }
 
                 uint32_t *gw = (uint32_t *)expert_data;
-                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
-                uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 2359296));
-                uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 4456448));
-                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 4587520));
-                uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 4718592));
-                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 6815744));
-                uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 6946816));
+                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : GATE_S_OFF_4));
+                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : GATE_B_OFF_4));
+                uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : UP_W_OFF_4));
+                uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : UP_S_OFF_4));
+                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : UP_B_OFF_4));
+                uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : DOWN_W_OFF_4));
+                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : DOWN_S_OFF_4));
+                uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : DOWN_B_OFF_4));
 
                 float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
                 float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
@@ -2937,7 +3288,7 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
 // Parallel I/O infrastructure for expert pread (from proven main.m pattern)
 // ============================================================================
 
-#define NUM_IO_THREADS 4  // 4 threads for K=4 experts (one per expert)
+#define NUM_IO_THREADS 8  // 8 threads for K=8 experts (one per expert)
 
 typedef struct {
     int fd;
@@ -3643,7 +3994,7 @@ static void infer_prefetch_shutdown(void) {
 
 // ============================================================================
 // Per-layer weight pointer cache — built once, eliminates 40+ snprintf+lookup
-// per layer per token. With 60 layers and 15 tokens = 36,000 lookups saved.
+// per layer per token. With 40 layers and 15 tokens = 24,000 lookups saved.
 // ============================================================================
 
 typedef struct {
@@ -3936,7 +4287,7 @@ static void discard_deferred_experts(void) {
 //   4. GPU-side combine in CMD3 (eliminates CPU deferred_wait + combine + norm)
 // ============================================================================
 
-// Static scratch buffers — allocated once, reused across all 60 layers per token.
+// Static scratch buffers — allocated once, reused across all 40 layers per token.
 // Eliminates ~20 malloc/free per layer = ~1200 alloc/free per token.
 static float *s_normed    = NULL;   // [HIDDEN_DIM]
 static float *s_residual  = NULL;   // [HIDDEN_DIM]
@@ -5479,14 +5830,14 @@ static void fused_layer_forward(
 
             // CPU fallback offsets — use 4-bit layout (2-bit CPU path not yet implemented)
             uint32_t *gw = (uint32_t *)expert_data;
-            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
-            uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 2359296));
-            uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 4456448));
-            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 4587520));
-            uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 4718592));
-            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 6815744));
-            uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 6946816));
+            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : GATE_S_OFF_4));
+            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : GATE_B_OFF_4));
+            uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : UP_W_OFF_4));
+            uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : UP_S_OFF_4));
+            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : UP_B_OFF_4));
+            uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : DOWN_W_OFF_4));
+            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : DOWN_S_OFF_4));
+            uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : DOWN_B_OFF_4));
 
             float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
             float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
@@ -5998,7 +6349,7 @@ static void serve_loop(
     static uint64_t req_counter = 0;
 
     // ---- System prompt cache: prefill system prompt once at startup ----
-    // Tokenize the system prompt and run it through all 60 layers.
+    // Tokenize the system prompt and run it through all 40 layers.
     // Save the resulting KV cache + linear attention state as a snapshot.
     // On each request, restore the snapshot instead of re-prefilling.
     fprintf(stderr, "[serve] Pre-caching system prompt...\n");
@@ -6107,12 +6458,12 @@ static void serve_loop(
     if (g_metal && g_metal->delta_net_step) {
         for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
             if (g_metal->buf_delta_state[i]) {
-                size_t sz = 64*128*128*sizeof(float);
+                size_t sz = (size_t)LINEAR_NUM_V_HEADS*LINEAR_VALUE_DIM*LINEAR_KEY_DIM*sizeof(float);
                 gpu_delta_snapshots[i] = malloc(sz);
                 memcpy(gpu_delta_snapshots[i], [g_metal->buf_delta_state[i] contents], sz);
             }
             if (g_metal->buf_conv_state[i]) {
-                size_t sz = 3*12288*sizeof(float);
+                size_t sz = (CONV_KERNEL_SIZE-1)*(size_t)LINEAR_CONV_DIM*sizeof(float);
                 gpu_conv_snapshots[i] = malloc(sz);
                 memcpy(gpu_conv_snapshots[i], [g_metal->buf_conv_state[i] contents], sz);
             }
@@ -6156,7 +6507,7 @@ static void serve_loop(
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "{\"status\":\"ok\",\"model\":\"qwen3.5-397b-a17b\"}\n";
+                "{\"status\":\"ok\",\"model\":\"qwen3.5-35b-a3b\"}\n";
             http_write_str(client_fd, resp);
             free(reqbuf); close(client_fd);
             continue;
@@ -6170,7 +6521,7 @@ static void serve_loop(
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.5-397b-a17b\","
+                "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.5-35b-a3b\","
                 "\"object\":\"model\",\"owned_by\":\"local\"}]}\n";
             http_write_str(client_fd, resp);
             free(reqbuf); close(client_fd);
@@ -6281,10 +6632,10 @@ static void serve_loop(
                     for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
                         if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
                             memcpy([g_metal->buf_delta_state[i] contents],
-                                   gpu_delta_snapshots[i], 64*128*128*sizeof(float));
+                                   gpu_delta_snapshots[i], (size_t)LINEAR_NUM_V_HEADS*LINEAR_VALUE_DIM*LINEAR_KEY_DIM*sizeof(float));
                         if (gpu_conv_snapshots[i] && g_metal->buf_conv_state[i])
                             memcpy([g_metal->buf_conv_state[i] contents],
-                                   gpu_conv_snapshots[i], 3*12288*sizeof(float));
+                                   gpu_conv_snapshots[i], (CONV_KERNEL_SIZE-1)*(size_t)LINEAR_CONV_DIM*sizeof(float));
                     }
                 } else {
                     reset_delta_net_state();
@@ -6530,7 +6881,7 @@ int main(int argc, char **argv) {
         const char *prompt_tokens_path = NULL;
         const char *prompt_text = NULL;
         int max_tokens = 20;
-        int K = 4;
+        int K = 8;
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
@@ -6648,7 +6999,7 @@ int main(int argc, char **argv) {
             g_expert_cache = expert_cache_new(g_metal->device, cache_entries);
         }
 
-        printf("=== Qwen3.5-397B-A17B Metal Inference Engine ===\n");
+        printf("=== Qwen3.5-35B-A3B Metal Inference Engine ===\n");
         printf("Model:    %s\n", model_path);
         printf("Weights:  %s\n", weights_path);
         printf("Manifest: %s\n", manifest_path);
@@ -6790,7 +7141,7 @@ int main(int argc, char **argv) {
                     snprintf(lz4_path, sizeof(lz4_path), "%s/packed_experts_lz4/layer_%02d.bin", model_path, i);
                     int lz4_fd = open(lz4_path, O_RDONLY);
                     if (lz4_fd >= 0) {
-                        // Load index header (512 entries × 16 bytes = 8KB)
+                        // Load index header (NUM_EXPERTS entries × 16 bytes)
                         g_lz4_index[i] = malloc(NUM_EXPERTS * sizeof(LZ4IndexEntry));
                         ssize_t nr = pread(lz4_fd, g_lz4_index[i],
                                            NUM_EXPERTS * sizeof(LZ4IndexEntry), 0);
@@ -7033,7 +7384,7 @@ int main(int argc, char **argv) {
             cache_telemetry_note_token();
             embed_lookup(wf, next_token, hidden);
 
-            // Run 60 layers (fused: 1+K cmd buffers per layer)
+            // Run 40 layers (fused: 1+K cmd buffers per layer)
             for (int layer = 0; layer < NUM_LAYERS; layer++) {
                 int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
                 fused_layer_forward(wf, layer, hidden,
