@@ -47,45 +47,22 @@ enum ModelCatalog {
         CatalogEntry(
             id: "qwen3.5-35b-a3b-q4",
             displayName: "Qwen 3.5 35B-A3B",
-            repoId: "flashmoe/Qwen3.5-35B-A3B-Q4-FlashMoE",
+            repoId: "alexintosh/Qwen3.5-35B-A3B-Q4-FlashMoE",
             description: "Compact 35B MoE model. 3B active params per token. Good for 8GB devices.",
-            totalSizeBytes: 11_200_000_000,
+            totalSizeBytes: 19_500_000_000,
             quantization: "4-bit",
-            expertLayers: 28,
+            expertLayers: 40,
             files: makeFileList(
                 configFiles: [
-                    ("config.json", 2_500),
-                    ("model_weights.json", 400_000),
-                    ("model_weights.bin", 1_200_000_000),
-                    ("vocab.bin", 5_500_000),
-                    ("tokenizer.json", 7_100_000),
-                    ("tokenizer.bin", 4_900_000),
+                    ("config.json", 3_809),
+                    ("model_weights.json", 251_539),
+                    ("model_weights.bin", 1_378_869_376),
+                    ("vocab.bin", 3_360_287),
+                    ("tokenizer.json", 19_989_343),
+                    ("tokenizer.bin", 8_201_040),
                 ],
-                expertLayers: 28,
-                expertLayerSize: 350_000_000
-            )
-        ),
-
-        // -- Qwen 3.5 397B-A17B (full model, needs 256GB+ iPhone storage) --
-        CatalogEntry(
-            id: "qwen3.5-397b-a17b-q4",
-            displayName: "Qwen 3.5 397B-A17B",
-            repoId: "flashmoe/Qwen3.5-397B-A17B-Q4-FlashMoE",
-            description: "Full 397B MoE model. 17B active params. Requires 209GB free space.",
-            totalSizeBytes: 209_000_000_000,
-            quantization: "4-bit",
-            expertLayers: 60,
-            files: makeFileList(
-                configFiles: [
-                    ("config.json", 2_500),
-                    ("model_weights.json", 500_000),
-                    ("model_weights.bin", 5_500_000_000),
-                    ("vocab.bin", 5_500_000),
-                    ("tokenizer.json", 7_100_000),
-                    ("tokenizer.bin", 4_900_000),
-                ],
-                expertLayers: 60,
-                expertLayerSize: 3_400_000_000
+                expertLayers: 40,
+                expertLayerSize: 452_984_832
             )
         ),
     ]
