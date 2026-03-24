@@ -1,3 +1,5 @@
+### since this project is for iOS support, mine will be independently supporting android
+
 # Flash-iOS
 
 Few tweaks for [@alexintosh](https://github.com/Alexintosh) (macOS, iOS memory and Fanout)
